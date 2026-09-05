@@ -43,22 +43,28 @@ public struct NXContactRow: Codable, Equatable, Sendable {
 
 /// Exact circular Coulomb contacts in the same KKT residual as body momentum. Each row contributes
 /// Jᵀλ to generalized momentum and a projection-based natural residual to its three multiplier slots.
-public struct NXContactContribution: NXPhysicsContribution {
+public struct NXContactContribution: NXPhysicsContribution, NXPhysicsConvergenceDiagnostics {
     public let name = "exact-circular-coulomb-contact"
     public let stateDimension: Int
     public let rows: [NXContactRow]
 
     public init(stateDimension: Int, rows: [NXContactRow]) throws {
         guard stateDimension > 0, !rows.isEmpty else { throw NXError.invalidConfiguration("contact contribution") }
-        var multipliers = Set<Int>()
+        var multiplierIndices = Set<Int>()
         for row in rows {
-            guard row.multiplierOffset + 3 <= stateDimension else { throw NXError.invalidConfiguration("contact multiplier range") }
-            for index in row.multiplierOffset..<(row.multiplierOffset + 3) {
-                guard multipliers.insert(index).inserted else { throw NXError.invalidConfiguration("overlapping contact multipliers") }
+            guard row.multiplierOffset <= stateDimension - 3 else {
+                throw NXError.invalidConfiguration("contact multiplier range")
             }
+            for index in row.multiplierOffset..<(row.multiplierOffset + 3) {
+                guard multiplierIndices.insert(index).inserted else {
+                    throw NXError.invalidConfiguration("overlapping contact multipliers")
+                }
+            }
+        }
+        for row in rows {
             for entry in row.normal + row.tangent1 + row.tangent2 {
-                guard entry.index < stateDimension, !multipliers.contains(entry.index) else {
-                    throw NXError.invalidConfiguration("contact Jacobian references invalid/generalized multiplier state")
+                guard entry.index < stateDimension, !multiplierIndices.contains(entry.index) else {
+                    throw NXError.invalidConfiguration("contact Jacobian references invalid/multiplier state")
                 }
             }
         }
@@ -115,14 +121,20 @@ public struct NXContactContribution: NXPhysicsContribution {
               state.allSatisfy(\.isFinite), direction.allSatisfy(\.isFinite) else {
             throw NXError.invalidState("contact safe step")
         }
-        // CCD owns geometric separation. Cone multipliers are globally projected by the residual and
-        // therefore do not need a positivity clipping step here.
         return NXGeometricCertificate(minimumDistance: 1, minimumDeterminantF: 1,
             minimumVolume: 1, minimumRodLength: 1, finite: true, safeStep: 1)
     }
 
+    public func convergenceMetrics(state: [Float]) throws -> NXPhysicsConvergenceMetrics {
+        let values = try maximumDiagnostics(state: state)
+        return try NXPhysicsConvergenceMetrics(coneDistance: values.coneDistance,
+            complementarity: values.complementarity)
+    }
+
     public func maximumDiagnostics(state: [Float]) throws -> (coneDistance: Float, complementarity: Float) {
-        guard state.count == stateDimension else { throw NXError.invalidState("contact diagnostic state") }
+        guard state.count == stateDimension, state.allSatisfy(\.isFinite) else {
+            throw NXError.invalidState("contact diagnostic state")
+        }
         var cone: Float = 0, complementarity: Float = 0
         for row in rows {
             let lambda = SIMD3<Float>(state[row.multiplierOffset], state[row.multiplierOffset + 1], state[row.multiplierOffset + 2])
