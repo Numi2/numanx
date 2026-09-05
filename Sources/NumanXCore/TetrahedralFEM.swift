@@ -25,7 +25,8 @@ public struct NXTetrahedron: Codable, Equatable, Sendable {
     public init(velocityOffsets: SIMD4<Int32>, previousPositions: [SIMD3<Float>],
                 inverseRestMatrix: NXMatrix3, restVolume: Float,
                 material: NXNeoHookeanMaterial) throws {
-        guard previousPositions.count == 4, velocityOffsets.min() >= 0,
+        guard previousPositions.count == 4,
+              (0..<4).allSatisfy({ velocityOffsets[$0] >= 0 }),
               restVolume.isFinite, restVolume > 0, inverseRestMatrix.allFinite,
               abs(inverseRestMatrix.determinant) > 1e-12,
               previousPositions.allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) else {
@@ -52,7 +53,9 @@ public struct NXTetrahedralFEMContribution: NXPhysicsContribution {
         for element in elements {
             for lane in 0..<4 {
                 let offset = Int(element.velocityOffsets[lane])
-                guard offset + 3 <= stateDimension else { throw NXError.invalidConfiguration("tetra velocity range") }
+                guard offset >= 0, offset <= stateDimension - 3 else {
+                    throw NXError.invalidConfiguration("tetra velocity range")
+                }
             }
         }
         self.stateDimension = stateDimension; self.timeStepSeconds = timeStepSeconds; self.elements = elements
@@ -63,7 +66,7 @@ public struct NXTetrahedralFEMContribution: NXPhysicsContribution {
             throw NXError.invalidState("FEM residual state")
         }
         for element in elements {
-            let positions = currentPositions(element, state: state, alpha: 1, direction: nil)
+            let positions = currentPositions(element, state: state, alpha: 0, direction: nil)
             let F = deformationGradient(element, positions: positions)
             let P = try firstPiola(F: F, material: element.material)
             let gradients = shapeGradients(element)
@@ -84,7 +87,7 @@ public struct NXTetrahedralFEMContribution: NXPhysicsContribution {
             throw NXError.invalidState("FEM Jv state")
         }
         for element in elements {
-            let positions = currentPositions(element, state: state, alpha: 1, direction: nil)
+            let positions = currentPositions(element, state: state, alpha: 0, direction: nil)
             let F = deformationGradient(element, positions: positions)
             let dF = directionalDeformationGradient(element, direction: vector)
             let dP = try firstPiolaDirectionalDerivative(F: F, dF: dF, material: element.material)
@@ -107,22 +110,23 @@ public struct NXTetrahedralFEMContribution: NXPhysicsContribution {
             throw NXError.invalidState("FEM safe-step state")
         }
         var safe: Float = 1
-        var minimumJ = Float.greatestFiniteMagnitude
+        var minimumCurrentJ = Float.greatestFiniteMagnitude
+        var minimumAcceptedJ = Float.greatestFiniteMagnitude
+        var minimumAcceptedVolume = Float.greatestFiniteMagnitude
         for element in elements {
-            let current = deformationGradient(element,
-                positions: currentPositions(element, state: state, alpha: 1, direction: nil))
-            let currentJ = current.determinant
+            let currentPositions = currentPositions(element, state: state, alpha: 0, direction: nil)
+            let currentJ = deformationGradient(element, positions: currentPositions).determinant
+            minimumCurrentJ = min(minimumCurrentJ, currentJ)
             guard currentJ.isFinite, currentJ > element.material.minimumDeterminant else {
                 return NXGeometricCertificate(minimumDistance: 1, minimumDeterminantF: currentJ,
                     minimumVolume: element.restVolume * currentJ, minimumRodLength: 1,
                     finite: currentJ.isFinite, safeStep: 0)
             }
-            let candidatePositions = currentPositions(element, state: state, alpha: 1, direction: direction)
-            let candidateJ = deformationGradient(element, positions: candidatePositions).determinant
-            minimumJ = min(minimumJ, candidateJ)
-            if !candidateJ.isFinite || candidateJ <= element.material.minimumDeterminant {
+            let fullPositions = currentPositions(element, state: state, alpha: 1, direction: direction)
+            let fullJ = deformationGradient(element, positions: fullPositions).determinant
+            if !fullJ.isFinite || fullJ <= element.material.minimumDeterminant {
                 var low: Float = 0, high: Float = safe
-                for _ in 0..<24 {
+                for _ in 0..<28 {
                     let middle = 0.5 * (low + high)
                     let positions = currentPositions(element, state: state, alpha: middle, direction: direction)
                     let j = deformationGradient(element, positions: positions).determinant
@@ -131,9 +135,17 @@ public struct NXTetrahedralFEMContribution: NXPhysicsContribution {
                 safe = min(safe, max(0, low * 0.95))
             }
         }
-        return NXGeometricCertificate(minimumDistance: 1, minimumDeterminantF: minimumJ,
-            minimumVolume: elements.map({ $0.restVolume }).min() ?? 1,
-            minimumRodLength: 1, finite: minimumJ.isFinite, safeStep: safe)
+        for element in elements {
+            let acceptedPositions = currentPositions(element, state: state, alpha: safe, direction: direction)
+            let acceptedJ = deformationGradient(element, positions: acceptedPositions).determinant
+            minimumAcceptedJ = min(minimumAcceptedJ, acceptedJ)
+            minimumAcceptedVolume = min(minimumAcceptedVolume, element.restVolume * acceptedJ)
+        }
+        return NXGeometricCertificate(minimumDistance: 1,
+            minimumDeterminantF: min(minimumCurrentJ, minimumAcceptedJ),
+            minimumVolume: minimumAcceptedVolume,
+            minimumRodLength: 1, finite: minimumAcceptedJ.isFinite && minimumAcceptedVolume.isFinite,
+            safeStep: safe)
     }
 
     private func currentPositions(_ element: NXTetrahedron, state: [Float], alpha: Float,
@@ -165,7 +177,6 @@ public struct NXTetrahedralFEMContribution: NXPhysicsContribution {
     }
 
     private func shapeGradients(_ element: NXTetrahedron) -> [SIMD3<Float>] {
-        // Reference gradients: columns of Dm^{-T} for N1,N2,N3; N0 = -sum.
         let invT = element.inverseRestMatrix.transposed
         let g1 = invT.c0, g2 = invT.c1, g3 = invT.c2
         return [-(g1 + g2 + g3), g1, g2, g3]
