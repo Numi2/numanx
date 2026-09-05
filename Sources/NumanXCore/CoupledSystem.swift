@@ -31,6 +31,24 @@ public protocol NXPhysicsContribution: Sendable {
     func admissibleStep(state: [Float], direction: [Float]) throws -> NXGeometricCertificate
 }
 
+public struct NXPhysicsConvergenceMetrics: Equatable, Sendable {
+    public var coneDistance: Float
+    public var complementarity: Float
+    public init(coneDistance: Float = 0, complementarity: Float = 0) throws {
+        guard coneDistance.isFinite, coneDistance >= 0,
+              complementarity.isFinite, complementarity >= 0 else {
+            throw NXError.invalidState("physics convergence metrics")
+        }
+        self.coneDistance = coneDistance; self.complementarity = complementarity
+    }
+}
+
+/// Terms with nonlinear admissibility conditions expose their own physically meaningful metrics.
+/// Aggregate residual magnitudes are never relabeled as cone distance or complementarity.
+public protocol NXPhysicsConvergenceDiagnostics: Sendable {
+    func convergenceMetrics(state: [Float]) throws -> NXPhysicsConvergenceMetrics
+}
+
 public protocol NXPreconditionerFactory: Sendable {
     func make(state: [Float], newtonIteration: Int) throws -> any NXPreconditioner
 }
@@ -57,6 +75,11 @@ public struct NXCoupledSystem: NXNonlinearProblem {
             }
         }
         guard covered.allSatisfy({ $0 }) else { throw NXError.invalidConfiguration("residual ranges leave holes") }
+        let hasContactUnknowns = residualRanges.contains { $0.block == .contact && !$0.range.isEmpty }
+        let hasContactDiagnostics = contributions.contains { $0 is any NXPhysicsConvergenceDiagnostics }
+        guard !hasContactUnknowns || hasContactDiagnostics else {
+            throw NXError.invalidConfiguration("contact residual requires exact convergence diagnostics")
+        }
         self.dimension = dimension; self.contributions = contributions
         self.residualRanges = residualRanges; self.preconditionerFactory = preconditionerFactory
     }
@@ -91,22 +114,32 @@ public struct NXCoupledSystem: NXNonlinearProblem {
             answer.safeStep = min(answer.safeStep, item.safeStep)
             answer.finite = answer.finite && item.finite
         }
+        guard answer.safeStep.isFinite, answer.safeStep >= 0, answer.safeStep <= 1 else {
+            throw NXError.numericalBreakdown("invalid aggregate safe step")
+        }
         return answer
     }
 
     public func diagnostics(at state: [Float], residual: [Float], newtonIterations: Int,
                             krylovIterations: Int, geometric: NXGeometricCertificate) throws -> NXConvergenceCertificate {
-        guard residual.count == dimension else { throw NXError.invalidState("diagnostic residual") }
+        guard state.count == dimension, residual.count == dimension else { throw NXError.invalidState("diagnostic residual") }
         var norms: [NXResidualBlock: Float] = [:]
         for item in residualRanges {
             let scaled = item.range.map { residual[$0] / item.scale }
             norms[item.block] = try NXVectorMath.norm(scaled)
         }
+        var coneDistance: Float = 0
+        var complementarity: Float = 0
+        for term in contributions {
+            guard let diagnostic = term as? any NXPhysicsConvergenceDiagnostics else { continue }
+            let metrics = try diagnostic.convergenceMetrics(state: state)
+            coneDistance = max(coneDistance, metrics.coneDistance)
+            complementarity = max(complementarity, metrics.complementarity)
+        }
         let total = try NXVectorMath.norm(residual)
         let reference = max(1, try NXVectorMath.norm(state))
         return NXConvergenceCertificate(residualNorm: total, relativeResidual: total / reference,
-            coneDistance: norms[.contact] ?? 0,
-            complementarity: norms[.contact] ?? 0,
+            coneDistance: coneDistance, complementarity: complementarity,
             pressureResidual: norms[.pressure] ?? 0,
             equalityResidual: norms[.equality] ?? 0,
             momentumResidual: norms[.momentum] ?? 0,
