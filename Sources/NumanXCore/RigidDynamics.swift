@@ -1,16 +1,38 @@
 import Foundation
 
+public struct NXVector6: Codable, Equatable, Sendable {
+    public var a: Float
+    public var b: Float
+    public var c: Float
+    public var d: Float
+    public var e: Float
+    public var f: Float
+
+    public init(_ a: Float = 0, _ b: Float = 0, _ c: Float = 0,
+                _ d: Float = 0, _ e: Float = 0, _ f: Float = 0) {
+        self.a = a; self.b = b; self.c = c; self.d = d; self.e = e; self.f = f
+    }
+    public static let zero = NXVector6()
+    public subscript(index: Int) -> Float {
+        get {
+            switch index { case 0: a; case 1: b; case 2: c; case 3: d; case 4: e; case 5: f; default: preconditionFailure("NXVector6 index") }
+        }
+        set {
+            switch index { case 0: a = newValue; case 1: b = newValue; case 2: c = newValue; case 3: d = newValue; case 4: e = newValue; case 5: f = newValue; default: preconditionFailure("NXVector6 index") }
+        }
+    }
+    public var allFinite: Bool { (0..<6).allSatisfy { self[$0].isFinite } }
+}
+
 public struct NXSpatialInertia: Codable, Equatable, Sendable {
     public var mass: Float
     public var centerOfMass: SIMD3<Float>
     /// Symmetric inertia tensor about the center of mass: xx, yy, zz, xy, xz, yz.
-    public var inertia: SIMD6<Float>
+    public var inertia: NXVector6
 
-    public init(mass: Float, centerOfMass: SIMD3<Float> = .zero, inertia: SIMD6<Float>) throws {
+    public init(mass: Float, centerOfMass: SIMD3<Float> = .zero, inertia: NXVector6) throws {
         guard mass.isFinite, mass > 0, centerOfMass.x.isFinite, centerOfMass.y.isFinite, centerOfMass.z.isFinite,
-              inertia.x.isFinite, inertia.y.isFinite, inertia.z.isFinite,
-              inertia.w.isFinite, inertia[4].isFinite, inertia[5].isFinite,
-              inertia.x > 0, inertia.y > 0, inertia.z > 0 else {
+              inertia.allFinite, inertia.a > 0, inertia.b > 0, inertia.c > 0 else {
             throw NXError.invalidConfiguration("spatial inertia")
         }
         self.mass = mass; self.centerOfMass = centerOfMass; self.inertia = inertia
@@ -19,7 +41,6 @@ public struct NXSpatialInertia: Codable, Equatable, Sendable {
     public func generalizedMassMatrix() -> [Float] {
         let m = mass
         let c = centerOfMass
-        // Spatial inertia in [linear, angular] ordering. Off-diagonal m*[c]x coupling.
         var a = Array(repeating: Float.zero, count: 36)
         for i in 0..<3 { a[i * 6 + i] = m }
         let skew: [[Float]] = [[0, -c.z, c.y], [c.z, 0, -c.x], [-c.y, c.x, 0]]
@@ -29,10 +50,9 @@ public struct NXSpatialInertia: Codable, Equatable, Sendable {
                 a[(r + 3) * 6 + col] = m * skew[r][col]
             }
         }
-        let ixx = inertia.x, iyy = inertia.y, izz = inertia.z
-        let ixy = inertia.w, ixz = inertia[4], iyz = inertia[5]
+        let ixx = inertia.a, iyy = inertia.b, izz = inertia.c
+        let ixy = inertia.d, ixz = inertia.e, iyz = inertia.f
         let Ic: [[Float]] = [[ixx, ixy, ixz], [ixy, iyy, iyz], [ixz, iyz, izz]]
-        // Parallel-axis: Ic + m*(||c||² I - c cᵀ).
         let c2 = c.x * c.x + c.y * c.y + c.z * c.z
         let cv = [c.x, c.y, c.z]
         for r in 0..<3 {
@@ -48,13 +68,12 @@ public struct NXSpatialInertia: Codable, Equatable, Sendable {
 public struct NXRigidBodyStep: Codable, Equatable, Sendable {
     public var velocityOffset: Int
     public var inertia: NXSpatialInertia
-    public var previousVelocity: SIMD6<Float>
-    public var externalImpulse: SIMD6<Float>
+    public var previousVelocity: NXVector6
+    public var externalImpulse: NXVector6
 
     public init(velocityOffset: Int, inertia: NXSpatialInertia,
-                previousVelocity: SIMD6<Float>, externalImpulse: SIMD6<Float> = .zero) throws {
-        guard velocityOffset >= 0,
-              (0..<6).allSatisfy({ previousVelocity[$0].isFinite && externalImpulse[$0].isFinite }) else {
+                previousVelocity: NXVector6, externalImpulse: NXVector6 = .zero) throws {
+        guard velocityOffset >= 0, previousVelocity.allFinite, externalImpulse.allFinite else {
             throw NXError.invalidConfiguration("rigid body step")
         }
         self.velocityOffset = velocityOffset; self.inertia = inertia
@@ -87,7 +106,7 @@ public struct NXRigidDynamicsContribution: NXPhysicsContribution {
         guard state.count == stateDimension, residual.count == stateDimension else { throw NXError.invalidState("rigid residual dimension") }
         for body in bodies {
             let matrix = body.inertia.generalizedMassMatrix()
-            var delta = SIMD6<Float>.zero
+            var delta = NXVector6.zero
             for i in 0..<6 { delta[i] = state[body.velocityOffset + i] - body.previousVelocity[i] }
             for row in 0..<6 {
                 var value = -body.externalImpulse[row]
