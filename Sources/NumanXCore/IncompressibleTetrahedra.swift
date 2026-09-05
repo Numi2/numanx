@@ -96,28 +96,36 @@ public struct NXIncompressibilityContribution: NXPhysicsContribution {
             let J = F.determinant
             guard J.isFinite, J > element.minimumDeterminant else { throw NXError.geometryRejected }
             let inv = try F.inverse(), invT = inv.transposed
-            let dF = directionalGradient(element, vector: vector)
-            let trace = NXMatrix3.dot(inv.transposed, dF)
-            let dJ = J * trace
+            let dFPerVelocity = directionalGradient(element, vector: vector)
+            let tracePerVelocity = NXMatrix3.dot(inv.transposed, dFPerVelocity)
+            let dJPerVelocity = J * tracePerVelocity
             let cofactor = J * invT
-            let dCofactor = dJ * invT - J * invT.multiplied(by: dF.transposed).multiplied(by: invT)
+            let dCofactorPerVelocity = dJPerVelocity * invT
+                - J * invT.multiplied(by: dFPerVelocity.transposed).multiplied(by: invT)
             let p = state[element.pressureIndex]
             let dp = vector[element.pressureIndex]
-            let dP = -dp * cofactor - p * dCofactor
+            let dPFromPressure = -dp * cofactor
+            let dPFromVelocity = -p * dCofactorPerVelocity
             let gradients = shapeGradients(element)
-            let mechanicalScale = timeStepSeconds * timeStepSeconds * element.restVolume
+            let pressureScale = timeStepSeconds * element.restVolume
+            let velocityScale = timeStepSeconds * timeStepSeconds * element.restVolume
             for node in 0..<4 {
-                let value = mechanicalScale * dP.apply(gradients[node])
+                let value = pressureScale * dPFromPressure.apply(gradients[node])
+                          + velocityScale * dPFromVelocity.apply(gradients[node])
                 let offset = Int(element.velocityOffsets[node])
                 product[offset] += value.x; product[offset + 1] += value.y; product[offset + 2] += value.z
             }
-            product[element.pressureIndex] += element.restVolume * (-timeStepSeconds * dJ + element.pressureCompliance * dp)
+            product[element.pressureIndex] += element.restVolume
+                * (-timeStepSeconds * dJPerVelocity + element.pressureCompliance * dp)
         }
         guard product.allSatisfy(\.isFinite) else { throw NXError.numericalBreakdown("incompressibility Jv") }
     }
 
     public func admissibleStep(state: [Float], direction: [Float]) throws -> NXGeometricCertificate {
-        guard state.count == stateDimension, direction.count == stateDimension else { throw NXError.invalidState("incompressibility safe step") }
+        guard state.count == stateDimension, direction.count == stateDimension,
+              state.allSatisfy(\.isFinite), direction.allSatisfy(\.isFinite) else {
+            throw NXError.invalidState("incompressibility safe step")
+        }
         var safe: Float = 1
         var minJ = Float.greatestFiniteMagnitude
         var minVolume = Float.greatestFiniteMagnitude
