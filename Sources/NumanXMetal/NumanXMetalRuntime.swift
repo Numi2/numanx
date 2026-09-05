@@ -17,13 +17,18 @@ public final class NXMetalRuntime: @unchecked Sendable {
     public let identity: NXMetalRuntimeIdentity
     public let commandQueue: any MTL4CommandQueue
     public let residencySet: any MTLResidencySet
+    private let commandAllocator: any MTL4CommandAllocator
+    private let commandBuffer: any MTL4CommandBuffer
     private let lock = NSLock()
     private var transactionOpen = false
+    private var commandBufferInUse = false
 
     public init(device: any MTLDevice, solverProgramFingerprint: UInt64,
                 initialResidencyCapacity: Int = 64) throws {
         guard solverProgramFingerprint > 0, initialResidencyCapacity > 0,
-              let queue = device.makeMTL4CommandQueue() else {
+              let queue = device.makeMTL4CommandQueue(),
+              let allocator = device.makeCommandAllocator(),
+              let buffer = device.makeCommandBuffer() else {
             throw NXError.invalidConfiguration("Metal 4 runtime")
         }
         let descriptor = MTLResidencySetDescriptor()
@@ -31,7 +36,8 @@ public final class NXMetalRuntime: @unchecked Sendable {
         descriptor.initialCapacity = initialResidencyCapacity
         let residency = try device.makeResidencySet(descriptor: descriptor)
         residency.commit(); residency.requestResidency()
-        self.device = device; commandQueue = queue; residencySet = residency
+        self.device = device; commandQueue = queue; commandAllocator = allocator
+        commandBuffer = buffer; residencySet = residency
         identity = NXMetalRuntimeIdentity(deviceRegistryID: device.registryID,
             deviceName: device.name, solverProgramFingerprint: solverProgramFingerprint,
             maximumThreadgroupWidth: 256,
@@ -40,7 +46,7 @@ public final class NXMetalRuntime: @unchecked Sendable {
 
     deinit { residencySet.endResidency() }
 
-    public func addPersistentAllocation(_ allocation: any MTLAllocation) throws {
+    public func addPersistentAllocation(_ allocation: any MTLBuffer) throws {
         lock.lock(); defer { lock.unlock() }
         guard !transactionOpen, allocation.device.registryID == device.registryID else {
             throw NXError.invalidState("residency mutation during transaction or foreign device")
@@ -51,24 +57,34 @@ public final class NXMetalRuntime: @unchecked Sendable {
 
     public func beginTransaction() throws {
         lock.lock(); defer { lock.unlock() }
-        guard !transactionOpen else { throw NXError.invalidState("Metal transaction already open") }
+        guard !transactionOpen, !commandBufferInUse else { throw NXError.invalidState("Metal transaction already open") }
         transactionOpen = true
     }
 
-    public func finishTransaction() {
-        lock.lock(); transactionOpen = false; lock.unlock()
+    public func finishTransaction() throws {
+        lock.lock(); defer { lock.unlock() }
+        guard transactionOpen, !commandBufferInUse else { throw NXError.invalidState("Metal command still encoded/in flight") }
+        transactionOpen = false
     }
 
-    public func withAuthoritativeCommandBuffer<T>(_ body: (any MTL4CommandBuffer) throws -> T) throws -> T {
-        lock.lock()
-        guard transactionOpen else { lock.unlock(); throw NXError.invalidState("no open Metal transaction") }
-        lock.unlock()
-        guard let allocator = device.makeCommandAllocator(), let commandBuffer = commandQueue.makeCommandBuffer(commandAllocator: allocator) else {
-            throw NXError.invalidConfiguration("Metal 4 command buffer")
-        }
-        commandBuffer.label = "NumanX authoritative shadow solve"
+    /// Encodes one pass into the reusable Metal 4 command buffer. The caller owns end/commit and
+    /// completion feedback because publication must remain part of the outer transaction timeline.
+    /// `releaseCommandBufferAfterOwnerCompletion` must be called only after terminal feedback.
+    public func beginAuthoritativeCommandBuffer() throws -> any MTL4CommandBuffer {
+        lock.lock(); defer { lock.unlock() }
+        guard transactionOpen, !commandBufferInUse else { throw NXError.invalidState("Metal command lifecycle") }
+        commandAllocator.reset()
+        commandBuffer.beginCommandBuffer(allocator: commandAllocator)
         commandBuffer.useResidencySet(residencySet)
-        return try body(commandBuffer)
+        commandBuffer.label = "NumanX authoritative shadow solve"
+        commandBufferInUse = true
+        return commandBuffer
+    }
+
+    public func releaseCommandBufferAfterOwnerCompletion() throws {
+        lock.lock(); defer { lock.unlock() }
+        guard transactionOpen, commandBufferInUse else { throw NXError.invalidState("no command buffer to release") }
+        commandBufferInUse = false
     }
 }
 
