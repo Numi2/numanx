@@ -1,69 +1,106 @@
 # NumanX
 
-Apple-native multiphysics runtime direction for the Numi suite.
+Apple-native monolithic multiphysics solver for the Numi suite.
 
-This repository currently implements **native prepared-state persistence and recovery support**.
-It does **not** yet contain the complete NumanX multiphysics solver. The recovery code is source
-implementation, not a statement that Swift compilation, numerical validation or Apple GPU execution
-has passed.
+This repository now contains an executable **solver core**, a Metal 4 hot-path target, and crash-safe
+prepared-state recovery support. It is still under active integration: the physics-specific rigid,
+ABA, FEM, MPM, DER, transport and native scene adapters are not all implemented here yet, and this
+development session did not run Swift builds, Metal compilation, numerical validation or benchmarks.
 
-## Implemented here
+## Numerical authority
+
+`NumanXCore` implements the authoritative nonlinear solve contract:
+
+- A single coupled state layout for primal variables, pressure, equality multipliers and exact
+  three-component circular-Coulomb contact multipliers.
+- Exact Euclidean projection onto the Lorentz cone and the natural contact residual
+  `lambda_hat - Proj_L(lambda_hat - rho*u_hat)`, including compliance, restitution and stabilization.
+- Matrix-free flexible restarted GMRES with explicit preconditioned basis storage, modified
+  Gram-Schmidt, conditional reorthogonalization and numerical-breakdown rejection.
+- Globally safeguarded semismooth Newton with safe-step certificates, bounded Armijo trials,
+  deterministic training budgets and a higher-accuracy adaptive profile.
+- A monolithic `NXCoupledSystem` in which rigid/articulated/FEM/MPM/rod/transport/contact terms add
+  to one residual and one Jacobian-vector product instead of being committed by separate solvers.
+- Tensor-Schur patch descriptors and cohorts, overlapping additive corrections, mixed-precision
+  advisory solves with FP32 promotion, and a deterministic dense micropatch reference backend.
+- `NXAuthoritativeSolver`: base generation -> unpublished shadow -> exact-token commit/abort, with
+  deterministic substep fallback. Failed candidates never mutate the committed state.
+
+The authoritative state and residual remain FP32. FP16/BF16 are permitted only inside approximate
+local preconditioner work and must return a finite FP32 correction before reaching Krylov state.
+
+## Metal 4 hot path
+
+`NumanXMetal` contains GPU kernels for:
+
+- AXPBY and vector scaling.
+- Finite-value failure detection.
+- Deterministic hierarchical dot-product reductions.
+- Exact circular-Coulomb natural residuals and cone/complementarity diagnostics.
+
+The runtime uses the Metal 4 ownership model already used by NumiBrain: one `MTL4CommandQueue`, a
+reusable `MTL4CommandBuffer`, a resettable `MTL4CommandAllocator`, explicit residency and an outer
+owner-controlled completion boundary. It deliberately does not create a hidden queue per solve or
+perform authoritative host readbacks in the Newton/Krylov hot loop.
+
+Metal 4 compute encoders unify compute and copy operations in one pass and bind resources through
+argument tables. Production patch kernels should therefore cohort topology/material/shape/precision
+classes once, retain their allocations, and launch indirect/batched work from the same GPU timeline.
+
+Apple references:
+
+- https://developer.apple.com/documentation/metal/understanding-the-metal-4-core-api
+- https://developer.apple.com/documentation/metal/mtl4computecommandencoder
+- https://developer.apple.com/documentation/metal/synchronizing-passes-with-consumer-barriers
+- https://developer.apple.com/documentation/metal/running-a-machine-learning-model-on-the-gpu-timeline
+
+## Recovery
 
 `NumanXRecovery` contains:
 
 - A checked prepared-state manifest binding transaction, generations, time, topology, configuration,
   authoritative metadata and exact GPU-image bytes.
-- `FileNumanXPreparedStateStore`: an exclusive, descriptor-relative, checksum-verified persistent
-  store with immutable prepare/commit/abort records, file/full synchronization and directory sync.
-- `NumanXRecoveryCoordinator`: prepare-before-vote, decision-before-publication, and idempotent
+- `FileNumanXPreparedStateStore`: exclusive descriptor-relative storage with checksum verification,
+  immutable prepare/commit/abort records, full file synchronization and directory synchronization.
+- `NumanXRecoveryCoordinator`: prepare-before-vote, decision-before-publication and idempotent
   roll-forward through a native owner that supplies an actual publication receipt.
-- A bounded `numanx-recovery inspect` executable and regression test source.
+- `numanx-recovery inspect`, which verifies persisted bytes and reports the durable decision without
+  creating a decision or publishing a generation.
 
-The persistence implementation stores real supplied metadata/GPU bytes, not merely a JSON digest.
-No GPU pointer is a valid persistent identity. The native solver must serialize the complete
-logical state and recreate private buffers, indirect arguments and residency after restart.
+No GPU virtual address is a persistent identity. A native solver recovery image must contain or
+content-address every logical state needed to rebuild private buffers, argument tables, indirect
+commands, topology, contact histories, transport state, RNG and pending events.
 
-## Build and inspect on the target machine
+## Build on the target Mac
 
 ```sh
 swift build
+swift test --filter NumanXCoreTests
 swift test --filter NumanXRecoveryTests
 swift run numanx-recovery status
-swift run numanx-recovery inspect /path/to/existing-store 2a
 ```
 
-The inspection command checks stored byte counts and SHA-256 values and reads the durable decision.
-It requires the exclusive store lock. It never creates a commit decision, restores a solver or moves
-physical hardware. No builds or tests were executed during this source-development increment.
+The committed tests cover Lorentz-cone geometry, Coulomb residual behavior, nonsymmetric matrix-free
+FGMRES, overlapping Tensor-Schur patches, semismooth Newton, state layout, shadow publication/abort,
+prepared-image integrity and recovery decision irreversibility. They are source tests only until run
+on the target toolchain.
 
-## Native-owner integration
+## Required production work
 
-Implement `NumanXVerifiedRecoverableSolver` in the authoritative solver module. Its capture method
-must wait for successful completion of every producer and include all restart-relevant state:
-positions, velocities, rotations, material/internal variables, pressures, contact/friction histories,
-transport/metabolic fields, constraints, topology, allocators, queued events, RNG and model identity.
-Immutable assets may be referenced only when their exact bytes remain available and verified.
+The next implementation layer is physics-specific rather than another abstraction layer:
 
-`makeDurablePreparedImage` returns the native manifest and bytes. `restorePreparedImage` validates and
-reconstructs an unpublished candidate. `publishRestoredPrepared` performs idempotent publication, and
-`committedPublicationReceipt` must report the actual native published identity, not echo an input
-manifest before GPU completion. The coordinator rejects unrelated or later generations instead of
-rewinding them to a stale candidate.
+1. Rigid 6x6 inertia and articulated multi-RHS ABA contributions plus their patch inverses.
+2. Implicit corotated/hyperelastic FEM residual/Jv and positive tangent surrogate patches.
+3. MPM particle-grid transfer, constitutive updates and multigrid preconditioning.
+4. DER rods/cables/sutures with banded or cyclic-reduction local solves.
+5. Pressure/incompressibility, attachment and transport blocks.
+6. Broadphase/CCD, exact Coulomb contact generation and persistent friction history.
+7. GPU-side safe-step reduction for CCD, det(F), volume and rod-length admissibility.
+8. Native scene serialization sufficient for `NumanXVerifiedRecoverableSolver`.
+9. NumiBrain/NumiTissue joint-root wiring and retained crash/fault qualification on Apple Silicon.
 
-Only the joint NumiBrain/NumiTissue/NumanX transaction manager may authorize `commit`. A prepared file
-without a decision stays undecided. After a commit decision, recovery completes publication; it
-never converts the transaction to abort. A persisted `committed` marker does not imply that a newly
-launched process has recreated its GPU buffers, so recovery verifies or restores the native owner
-before declaring the runtime available.
+The core is designed so these blocks add residuals/Jv/preconditioner patches to one authoritative
+Newton solve. They must not create separate publication domains that can drift from the body root.
 
-## What is not claimed
-
-No native NumanX numerical implementation was found in this standalone repository. NumiLab has a
-separate Matter runtime and accepted-snapshot exporter; the inspected exporter does not establish a
-complete unpublished NumanX/MyoSim image. This package neither fabricates that model nor substitutes
-a toy solver while claiming full-suite integration.
-
-The native state adapter, full owner-transaction insertion, authentic joint decision transport and
-Apple Silicon crash/fault campaign remain integration work. Local durable records are not distributed
-consensus or signatures. A physical actuator or living-culture stimulus is not rollback-capable and
-must remain outside the reversible simulation transaction.
+A physical actuator or living-culture stimulus remains outside the reversible simulation transaction.
+Local recovery files are durable state, not distributed consensus, signatures or safety approval.
