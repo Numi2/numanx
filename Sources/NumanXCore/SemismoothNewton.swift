@@ -7,7 +7,8 @@ public protocol NXNonlinearProblem: Sendable {
     func preconditioner(at state: [Float], newtonIteration: Int) throws -> any NXPreconditioner
     /// Returns the largest admissible step in (0,1] allowed by CCD, det(F), volume and rod-length checks.
     func safeStep(from state: [Float], along direction: [Float]) throws -> NXGeometricCertificate
-    /// Optional decomposition diagnostics. Implementations should return authoritative scaled units.
+    /// Authoritative convergence decomposition. A solver success requires all declared components,
+    /// not only a small aggregate residual.
     func diagnostics(at state: [Float], residual: [Float], newtonIterations: Int,
                      krylovIterations: Int, geometric: NXGeometricCertificate) throws -> NXConvergenceCertificate
 }
@@ -41,7 +42,8 @@ public enum NXSemismoothNewton {
             let certificate = try problem.diagnostics(at: x, residual: residual,
                 newtonIterations: newton, krylovIterations: totalKrylov, geometric: geometric)
             lastCertificate = certificate
-            if residualNorm <= profile.absoluteResidualTolerance || relative <= profile.relativeResidualTolerance {
+            if convergenceSatisfied(certificate: certificate, residualNorm: residualNorm,
+                                    relative: relative, profile: profile) {
                 return NXNewtonResult(state: x, disposition: .committed(certificate))
             }
 
@@ -57,14 +59,16 @@ public enum NXSemismoothNewton {
             }
             let krylov = try NXFGMRES.solve(operator: jacobian, preconditioner: preconditioner,
                 rhs: rhs, maximumIterations: profile.maximumKrylovIterations,
-                restart: profile.krylovRestart, relativeTolerance: min(0.5, max(profile.relativeResidualTolerance, 0.05 * relative)),
+                restart: profile.krylovRestart,
+                relativeTolerance: min(0.5, max(profile.relativeResidualTolerance, 0.05 * relative)),
                 absoluteTolerance: profile.absoluteResidualTolerance)
             totalKrylov += krylov.iterations
             guard krylov.solution.count == n, krylov.solution.allSatisfy(\.isFinite) else {
                 throw NXError.numericalBreakdown("Newton direction")
             }
 
-            let safety = try problem.safeStep(from: x, along: krylov.solution).validated(minimumSafeStep: profile.minimumSafeStep)
+            let safety = try problem.safeStep(from: x, along: krylov.solution)
+                .validated(minimumSafeStep: profile.minimumSafeStep)
             var alpha = min(1, safety.safeStep)
             let merit0 = 0.5 * residualNorm * residualNorm
             var accepted = false
@@ -101,22 +105,45 @@ public enum NXSemismoothNewton {
 
             guard accepted else {
                 return NXNewtonResult(state: x,
-                    disposition: profile.mode == .boundedDeterministic ? .substepRequired(lastCertificate) : .rejected(lastCertificate))
+                    disposition: profile.mode == .boundedDeterministic
+                        ? .substepRequired(lastCertificate) : .rejected(lastCertificate))
             }
             x = acceptedState
             residual = acceptedResidual
         }
 
+        let residualNorm = try NXVectorMath.norm(residual)
+        let relative = residualNorm / initialNorm
         let geometric = try problem.safeStep(from: x, along: Array(repeating: 0, count: n))
         let certificate = try problem.diagnostics(at: x, residual: residual,
             newtonIterations: profile.maximumNewtonIterations, krylovIterations: totalKrylov, geometric: geometric)
-        if certificate.relativeResidual <= profile.relativeResidualTolerance &&
-           certificate.coneDistance <= profile.coneTolerance &&
-           certificate.complementarity <= profile.complementarityTolerance {
+        if convergenceSatisfied(certificate: certificate, residualNorm: residualNorm,
+                                relative: relative, profile: profile) {
             return NXNewtonResult(state: x, disposition: .committed(certificate))
         }
         return NXNewtonResult(state: x,
-            disposition: profile.mode == .boundedDeterministic ? .substepRequired(certificate) : .rejected(certificate))
+            disposition: profile.mode == .boundedDeterministic
+                ? .substepRequired(certificate) : .rejected(certificate))
+    }
+
+    private static func convergenceSatisfied(certificate: NXConvergenceCertificate,
+                                             residualNorm: Float, relative: Float,
+                                             profile: NXExecutionProfile) -> Bool {
+        let residualPass = residualNorm <= profile.absoluteResidualTolerance
+            || relative <= profile.relativeResidualTolerance
+        return residualPass
+            && certificate.residualNorm.isFinite
+            && certificate.relativeResidual.isFinite
+            && certificate.coneDistance.isFinite
+            && certificate.complementarity.isFinite
+            && certificate.pressureResidual.isFinite
+            && certificate.equalityResidual.isFinite
+            && certificate.momentumResidual.isFinite
+            && certificate.coneDistance <= profile.coneTolerance
+            && certificate.complementarity <= profile.complementarityTolerance
+            && certificate.geometric.finite
+            && certificate.geometric.safeStep >= 0
+            && certificate.geometric.safeStep <= 1
     }
 
     private static func validate(_ vector: [Float], count: Int, label: String) throws {
