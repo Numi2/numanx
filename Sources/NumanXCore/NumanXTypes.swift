@@ -30,10 +30,14 @@ public struct NXExecutionProfile: Codable, Equatable, Sendable {
         guard maximumNewtonIterations > 0, maximumKrylovIterations > 0,
               krylovRestart > 0, krylovRestart <= maximumKrylovIterations,
               maximumLineSearchTrials > 0,
-              relativeResidualTolerance > 0, absoluteResidualTolerance > 0,
-              coneTolerance > 0, complementarityTolerance > 0,
-              minimumSafeStep > 0, minimumSafeStep <= 1,
-              armijo > 0, armijo < 1 else { throw NXError.invalidConfiguration("execution profile") }
+              relativeResidualTolerance.isFinite, relativeResidualTolerance > 0,
+              absoluteResidualTolerance.isFinite, absoluteResidualTolerance > 0,
+              coneTolerance.isFinite, coneTolerance > 0,
+              complementarityTolerance.isFinite, complementarityTolerance > 0,
+              minimumSafeStep.isFinite, minimumSafeStep > 0, minimumSafeStep <= 1,
+              armijo.isFinite, armijo > 0, armijo < 1 else {
+            throw NXError.invalidConfiguration("execution profile")
+        }
         self.mode = mode
         self.maximumNewtonIterations = maximumNewtonIterations
         self.maximumKrylovIterations = maximumKrylovIterations
@@ -74,12 +78,19 @@ public struct NXStateLayout: Codable, Equatable, Sendable {
             throw NXError.invalidConfiguration("state layout")
         }
         var cursor = 0
-        primalRange = cursor..<(cursor + primalCount); cursor += primalCount
-        pressureRange = cursor..<(cursor + pressureCount); cursor += pressureCount
-        equalityMultiplierRange = cursor..<(cursor + equalityMultiplierCount); cursor += equalityMultiplierCount
+        func append(_ count: Int) throws -> Range<Int> {
+            let next = cursor.addingReportingOverflow(count)
+            guard !next.overflow, next.partialValue >= cursor else { throw NXError.capacity("state layout") }
+            let range = cursor..<next.partialValue
+            cursor = next.partialValue
+            return range
+        }
+        primalRange = try append(primalCount)
+        pressureRange = try append(pressureCount)
+        equalityMultiplierRange = try append(equalityMultiplierCount)
         let contactScalars = contactCount.multipliedReportingOverflow(by: 3)
         guard !contactScalars.overflow else { throw NXError.capacity("contact layout") }
-        contactMultiplierRange = cursor..<(cursor + contactScalars.partialValue)
+        contactMultiplierRange = try append(contactScalars.partialValue)
     }
     public var scalarCount: Int { contactMultiplierRange.upperBound }
     public var contactCount: Int { contactMultiplierRange.count / 3 }
@@ -117,7 +128,8 @@ public struct NXGeometricCertificate: Codable, Equatable, Sendable {
         self.finite = finite; self.safeStep = safeStep
     }
     public func validated(minimumSafeStep: Float) throws -> Self {
-        guard finite, minimumDistance.isFinite, minimumDeterminantF.isFinite,
+        guard minimumSafeStep.isFinite, minimumSafeStep > 0, minimumSafeStep <= 1,
+              finite, minimumDistance.isFinite, minimumDeterminantF.isFinite,
               minimumVolume.isFinite, minimumRodLength.isFinite, safeStep.isFinite,
               safeStep >= minimumSafeStep, safeStep <= 1 else { throw NXError.geometryRejected }
         return self
@@ -137,10 +149,16 @@ public struct NXConvergenceCertificate: Codable, Equatable, Sendable {
     public var geometric: NXGeometricCertificate
 
     public func satisfies(_ profile: NXExecutionProfile) -> Bool {
-        residualNorm.isFinite && relativeResidual.isFinite && coneDistance.isFinite && complementarity.isFinite &&
-        residualNorm <= max(profile.absoluteResidualTolerance, profile.relativeResidualTolerance) &&
-        relativeResidual <= profile.relativeResidualTolerance && coneDistance <= profile.coneTolerance &&
-        complementarity <= profile.complementarityTolerance && geometric.finite
+        let finiteMetrics = residualNorm.isFinite && relativeResidual.isFinite
+            && coneDistance.isFinite && complementarity.isFinite
+            && pressureResidual.isFinite && equalityResidual.isFinite && momentumResidual.isFinite
+        let residualPass = residualNorm <= profile.absoluteResidualTolerance
+            || relativeResidual <= profile.relativeResidualTolerance
+        return finiteMetrics && residualPass
+            && coneDistance <= profile.coneTolerance
+            && complementarity <= profile.complementarityTolerance
+            && geometric.finite && geometric.safeStep.isFinite
+            && geometric.safeStep >= 0 && geometric.safeStep <= 1
     }
 }
 
